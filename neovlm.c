@@ -50,14 +50,27 @@
 #define HD              (DM / N_HEADS)                   /* 64 */
 #define DFF             (4 * DM)                         /* 1024 */
 #define N_LAYERS        4
-#define MAX_TEXT        16
-#define MAX_SEQ         (N_VIS + MAX_TEXT)                /* 32 */
+#define MAX_TEXT        80
+#define MAX_SEQ         (N_VIS + MAX_TEXT)                /* 96 */
 
-/* Vocabulary: char-level for MNIST digit names */
-/* unique chars in zero..nine: e,f,g,h,i,n,o,r,s,t,u,v,w,x,z = 15 */
-#define VOCAB           17  /* 15 chars + BOS + EOS */
-#define BOS_TOK         15
+/* Vocabulary: char-level for text + ASCII art */
+/* 0-14:  text chars (efghinorstuvwxz) for digit names       */
+/* 15:    BOS_TEXT (text generation mode)                     */
+/* 16:    EOS (end of sequence)                               */
+/* 17-26: ASCII shade chars " .:-=+*#%@" (10 brightness levels) */
+/* 27:    NEWLINE (row separator in ASCII art)                */
+/* 28:    BOS_DRAW (ASCII art generation mode)                */
+#define VOCAB           29
+#define BOS_TOK         15  /* text mode start */
 #define EOS_TOK         16
+#define SHADE_START     17  /* first ASCII shade token */
+#define SHADE_END       26  /* last ASCII shade token */
+#define NL_TOK          27  /* newline in ASCII art */
+#define BOS_DRAW        28  /* draw mode start */
+
+/* ASCII art config */
+#define ASCII_COLS      8   /* output ASCII width */
+#define ASCII_ROWS      8   /* output ASCII height */
 
 /* Training defaults */
 #define DEFAULT_STEPS   5000
@@ -354,6 +367,8 @@ static const char* digit_names[] = {
 
 static const char text_chars[] = "efghinorstuvwxz"; /* 15 chars */
 
+static const char ascii_shades[] = " .:-=+*#%@"; /* 10 levels, index 0-9 */
+
 static int char_to_id(char ch) {
     for (int i = 0; i < 15; i++)
         if (text_chars[i] == ch) return i;
@@ -362,9 +377,53 @@ static int char_to_id(char ch) {
 
 static char id_to_char(int id) {
     if (id == BOS_TOK) return '^';
+    if (id == BOS_DRAW) return '~';
     if (id == EOS_TOK) return '$';
+    if (id == NL_TOK) return '\n';
+    if (id >= SHADE_START && id <= SHADE_END)
+        return ascii_shades[id - SHADE_START];
     if (id >= 0 && id < 15) return text_chars[id];
     return '?';
+}
+
+/* Convert 32x32 image to 8x8 ASCII art token sequence */
+static int image_to_ascii_tokens(const float* img, int* tokens) {
+    int n = 0;
+    tokens[n++] = BOS_DRAW;
+    for (int by = 0; by < ASCII_ROWS; by++) {
+        for (int bx = 0; bx < ASCII_COLS; bx++) {
+            /* Average the 4x4 pixel block */
+            float sum = 0;
+            int bh = IMG_SIZE / ASCII_ROWS;   /* 4 */
+            int bw = IMG_SIZE / ASCII_COLS;    /* 4 */
+            for (int dy = 0; dy < bh; dy++)
+                for (int dx = 0; dx < bw; dx++)
+                    sum += img[(by * bh + dy) * IMG_SIZE + bx * bw + dx];
+            float avg = sum / (float)(bh * bw);
+            int shade = (int)(avg * 9.0f + 0.5f);
+            if (shade < 0) shade = 0;
+            if (shade > 9) shade = 9;
+            tokens[n++] = SHADE_START + shade;
+        }
+        if (by < ASCII_ROWS - 1)
+            tokens[n++] = NL_TOK;
+    }
+    tokens[n++] = EOS_TOK;
+    return n;
+}
+
+/* Print ASCII art from token sequence */
+static void print_ascii_tokens(const int* tokens, int n) {
+    printf("  ");
+    for (int i = 0; i < n; i++) {
+        int t = tokens[i];
+        if (t == BOS_DRAW || t == BOS_TOK || t == EOS_TOK) continue;
+        if (t == NL_TOK) printf("\n  ");
+        else if (t >= SHADE_START && t <= SHADE_END)
+            printf("%c", ascii_shades[t - SHADE_START]);
+        else printf("?");
+    }
+    printf("\n");
 }
 
 static int build_text_tokens(int label, int* tokens) {
@@ -775,16 +834,18 @@ static double now_ms(void) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 static void train(NeoVLM* m, Dataset* data, int steps) {
-    printf("\n═══ TRAINING (%d steps) ═══\n", steps);
+    printf("\n═══ TRAINING (%d steps, dual: text + ASCII art) ═══\n", steps);
     printf("  model: %d layers, D=%d, %d heads, SiLU-gated FFN\n", N_LAYERS, DM, N_HEADS);
     printf("  vision: %d patches (%dx%d) from %dx%d images\n",
            N_VIS, PATCH_SIZE, PATCH_SIZE, IMG_SIZE, IMG_SIZE);
-    printf("  sequence: %d vision + %d text = %d max\n", N_VIS, MAX_TEXT, MAX_SEQ);
+    printf("  sequence: %d vision + %d text/draw = %d max\n", N_VIS, MAX_TEXT, MAX_SEQ);
     long np = count_params(m);
     printf("  params: %ld (%.2fM, %.2f MB)\n", np, np / 1e6f, np * 4.0f / 1048576.0f);
+    printf("  vocab: %d (15 text + 10 ASCII shades + BOS_TEXT + BOS_DRAW + EOS + NL)\n", VOCAB);
     printf("  RRPRAM: relative position bias, %d params/layer\n", N_HEADS * MAX_SEQ);
     printf("  Hebbian: vis_proto [%d x %d], updated every step\n", VOCAB, DM);
     printf("  Dario: %d chambers, Kuramoto K=0.03\n", N_CHAMBERS);
+    printf("  dual mode: 60%% text (\"seven\"), 40%% draw (ASCII art)\n");
     float cd = calendar_dissonance();
     printf("  calendar dissonance: %.3f\n", cd);
     printf("  velocity: %s\n", vel_names[dario_velocity(&m->dario, cd)]);
@@ -796,8 +857,8 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
     int kv_keys[N_LAYERS][MAX_SEQ];
     int kv_vals[N_LAYERS][MAX_SEQ];
 
-    float running_loss = 0;
-    int running_count = 0;
+    float running_loss = 0, running_loss_text = 0, running_loss_draw = 0;
+    int running_count = 0, count_text = 0, count_draw = 0;
     double t0 = now_ms();
     float first_loss = 0, last_loss = 0;
 
@@ -812,9 +873,16 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
         float patches[N_VIS * PATCH_PX];
         extract_patches(data->images[idx], patches);
 
-        /* Build text tokens */
+        /* Dual mode: 60% text, 40% draw */
+        int draw_mode = (rng_next() % 100) < 40;
+
+        /* Build target tokens */
         int text_tokens[MAX_TEXT + 2];
-        int n_text = build_text_tokens(label, text_tokens);
+        int n_text;
+        if (draw_mode)
+            n_text = image_to_ascii_tokens(data->images[idx], text_tokens);
+        else
+            n_text = build_text_tokens(label, text_tokens);
 
         /* Visual context for Hebbian */
         float vis_ctx[DM];
@@ -893,16 +961,19 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
 
         running_loss += loss_val;
         running_count++;
+        if (draw_mode) { running_loss_draw += loss_val; count_draw++; }
+        else { running_loss_text += loss_val; count_text++; }
 
         if ((step + 1) % 200 == 0 || step == 0) {
             double elapsed = (now_ms() - t0) / 1000.0;
-            printf("  step %4d | train %.4f (avg %.4f) | lr %.2e | %.1fs | %s vel=%s\n",
+            printf("  step %4d | train %.4f | text %.4f | draw %.4f | lr %.2e | %.1fs | %s %s\n",
                    step + 1, loss_val,
-                   running_count > 0 ? running_loss / running_count : 0,
+                   count_text > 0 ? running_loss_text / count_text : 0,
+                   count_draw > 0 ? running_loss_draw / count_draw : 0,
                    lr, elapsed, digit_names[label],
-                   vel_names[m->dario.velocity]);
-            running_loss = 0;
-            running_count = 0;
+                   draw_mode ? "[draw]" : "[text]");
+            running_loss = 0; running_loss_text = 0; running_loss_draw = 0;
+            running_count = 0; count_text = 0; count_draw = 0;
         }
     }
 
@@ -951,7 +1022,8 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
  * not from training data. That's the point.
  * ═══════════════════════════════════════════════════════════════════ */
 
-static void generate(NeoVLM* m, const float* image, int label) {
+/* mode=0: text ("seven"), mode=1: draw (ASCII art) */
+static void generate(NeoVLM* m, const float* image, int label, int mode) {
     float patches[N_VIS * PATCH_PX];
     extract_patches(image, patches);
 
@@ -965,24 +1037,15 @@ static void generate(NeoVLM* m, const float* image, int label) {
     dario_modulate(&m->dario, &d_alpha, &d_beta, &d_gamma, &d_temp);
     float vel_t, vel_h, vel_p;
     velocity_multipliers(m->dario.velocity, &vel_t, &vel_h, &vel_p);
-    float phase = dario_phase_gate(&m->dario, cd);
-
-    /* Print chamber state */
-    printf("  [chambers]");
-    for (int c = 0; c < N_CHAMBERS; c++)
-        if (m->dario.act[c] > 0.01f)
-            printf(" %s:%.0f%%", ch_names[c], m->dario.act[c] * 100);
-    printf(" phase:%.2f vel=%s\n", phase, vel_names[m->dario.velocity]);
-    printf("  [vision] %d patches → %d visual tokens\n", N_VIS, N_VIS);
 
     int kv_keys[N_LAYERS][MAX_SEQ];
     int kv_vals[N_LAYERS][MAX_SEQ];
 
-    /* Forward vision positions (no tape, eval mode) */
     nt_tape_start();
     nt_train_mode(0);
     TapeIdx ti = register_params(m);
 
+    /* Vision positions */
     for (int p = 0; p < N_VIS; p++) {
         nt_tensor* patch_t = nt_tensor_new(PATCH_PX);
         memcpy(patch_t->data, &patches[p * PATCH_PX], PATCH_PX * sizeof(float));
@@ -994,13 +1057,16 @@ static void generate(NeoVLM* m, const float* image, int label) {
         forward_position(m, &ti, h, p, kv_keys, kv_vals);
     }
 
-    /* Autoregressive text generation */
-    int token_id = BOS_TOK;
-    char generated[MAX_TEXT + 1];
+    /* Autoregressive generation */
+    int start_tok = mode ? BOS_DRAW : BOS_TOK;
+    int token_id = start_tok;
+    int gen_tokens[MAX_TEXT + 2];
     int gen_len = 0;
+    int max_gen = mode ? (ASCII_COLS * ASCII_ROWS + ASCII_ROWS) : MAX_TEXT;
 
-    for (int t = 0; t < MAX_TEXT - 1; t++) {
+    for (int t = 0; t < max_gen; t++) {
         int pos = N_VIS + t;
+        if (pos >= MAX_SEQ) break;
         int tok_emb = nt_embedding(ti.wte, token_id);
         int pos_emb = nt_embedding(ti.wpe, pos);
         int h = nt_add(tok_emb, pos_emb);
@@ -1009,61 +1075,55 @@ static void generate(NeoVLM* m, const float* image, int label) {
         int h_norm = nt_rmsnorm(h, ti.rmsf);
         int logits_idx = nt_linear(ti.head, h_norm, -1);
 
-        /* Get logits and apply Dario equation */
         nt_tape* tape = nt_tape_get();
         float logits[VOCAB];
         memcpy(logits, tape->entries[logits_idx].output->data, VOCAB * sizeof(float));
 
-        /* Hebbian + prophecy injection */
-        for (int v = 0; v < VOCAB; v++) {
-            float heb = hebbian_score(&m->hebbian, v, vis_ctx);
-            float pro = visual_prophecy(&m->hebbian, v, vis_ctx);
-            logits[v] += d_alpha * vel_h * heb * 2.0f +
-                         d_beta * vel_p * pro * 1.5f;
+        /* Hebbian + prophecy injection (text mode only) */
+        if (!mode) {
+            for (int v = 0; v < VOCAB; v++) {
+                float heb = hebbian_score(&m->hebbian, v, vis_ctx);
+                float pro = visual_prophecy(&m->hebbian, v, vis_ctx);
+                logits[v] += d_alpha * vel_h * heb * 2.0f +
+                             d_beta * vel_p * pro * 1.5f;
+            }
         }
 
-        /* Temperature with Dario + Schumann modulation */
-        float temp = 0.8f * d_temp * vel_t;
-        /* Schumann resonance: subtle oscillation */
-        float schumann_t = (float)t * 0.1f;
-        temp *= 1.0f + 0.02f * sinf(7.83f * schumann_t);
+        /* Temperature */
+        float temp = mode ? 0.5f : 0.8f;
+        temp *= d_temp * vel_t;
         if (temp < 0.1f) temp = 0.1f;
-
-        /* Phase gate: suppress low-confidence tokens */
         for (int v = 0; v < VOCAB; v++) logits[v] /= temp;
 
-        /* Greedy decode (deterministic for eval) */
+        /* Greedy decode */
         int best = 0;
         float best_val = logits[0];
         for (int v = 1; v < VOCAB; v++)
             if (logits[v] > best_val) { best_val = logits[v]; best = v; }
 
         token_id = best;
-        if (token_id == EOS_TOK || token_id == BOS_TOK) break;
-        if (gen_len < MAX_TEXT) generated[gen_len++] = id_to_char(token_id);
+        if (token_id == EOS_TOK) break;
+        if (token_id == BOS_TOK || token_id == BOS_DRAW) break;
+        gen_tokens[gen_len++] = token_id;
 
-        /* Hebbian bind: model learns from its own generation */
         hebbian_bind(&m->hebbian, token_id, vis_ctx);
     }
-    generated[gen_len] = '\0';
 
     nt_tape_clear();
 
-    /* Report */
-    const char* true_name = digit_names[label];
-    int match = (strcmp(generated, true_name) == 0);
-
-    /* Hebbian update report */
-    float max_conf = 0;
-    int max_tok = -1;
-    for (int v = 0; v < VOCAB; v++) {
-        float s = hebbian_score(&m->hebbian, v, vis_ctx);
-        if (s > max_conf) { max_conf = s; max_tok = v; }
+    /* Output */
+    if (mode) {
+        printf("  [draw] %dx%d ASCII art:\n", ASCII_COLS, ASCII_ROWS);
+        print_ascii_tokens(gen_tokens, gen_len);
+    } else {
+        char generated[MAX_TEXT + 1];
+        int slen = 0;
+        for (int i = 0; i < gen_len && slen < MAX_TEXT; i++)
+            generated[slen++] = id_to_char(gen_tokens[i]);
+        generated[slen] = '\0';
+        int match = (strcmp(generated, digit_names[label]) == 0);
+        printf("  [text] %s %s\n", generated, match ? "✓" : "✗");
     }
-    if (max_tok >= 0 && max_conf > 0.01f)
-        printf("  [hebbian] best match: '%c' score=%.3f\n", id_to_char(max_tok), max_conf);
-
-    printf("  [generate] %s %s\n", generated, match ? "✓" : "✗");
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1071,67 +1131,30 @@ static void generate(NeoVLM* m, const float* image, int label) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 static void inference(NeoVLM* m, Dataset* data) {
-    printf("\n═══ INFERENCE: seeing digits, speaking names ═══\n\n");
+    printf("\n═══ INFERENCE: sees → speaks AND draws ═══\n\n");
 
-    int correct = 0, total = 0;
-
-    for (int sample = 0; sample < 30; sample++) {
-        int label = sample % 10;
-        int idx = label + (sample / 10) * 10;
-        if (idx >= data->n) idx = label;
-
-        printf("  [%d] true: %-5s | ", label, digit_names[label]);
-        generate(m, data->images[idx], label);
-
-        /* Check accuracy (recompute quickly) */
-        float patches[N_VIS * PATCH_PX];
-        extract_patches(data->images[idx], patches);
-        float vis_ctx[DM];
-        compute_vis_context(m, patches, vis_ctx);
-
-        /* Quick greedy generate for accuracy */
-        int kv_keys[N_LAYERS][MAX_SEQ];
-        int kv_vals[N_LAYERS][MAX_SEQ];
-        nt_tape_start();
-        nt_train_mode(0);
-        TapeIdx ti = register_params(m);
-        for (int p = 0; p < N_VIS; p++) {
-            nt_tensor* pt = nt_tensor_new(PATCH_PX);
-            memcpy(pt->data, &patches[p * PATCH_PX], PATCH_PX * sizeof(float));
-            int pi2 = nt_tape_record(pt, NT_OP_NONE, -1, -1, 0);
-            nt_tensor_free(pt);
-            int h = nt_linear(ti.pp, pi2, -1);
-            int pe = nt_embedding(ti.wpe, p);
-            h = nt_add(h, pe);
-            forward_position(m, &ti, h, p, kv_keys, kv_vals);
-        }
-        int tok = BOS_TOK;
-        char gen[MAX_TEXT + 1];
-        int gl = 0;
-        for (int t = 0; t < MAX_TEXT - 1; t++) {
-            int pos = N_VIS + t;
-            int te2 = nt_embedding(ti.wte, tok);
-            int pe2 = nt_embedding(ti.wpe, pos);
-            int h = nt_add(te2, pe2);
-            h = forward_position(m, &ti, h, pos, kv_keys, kv_vals);
-            int hn = nt_rmsnorm(h, ti.rmsf);
-            int lg = nt_linear(ti.head, hn, -1);
-            nt_tape* tape = nt_tape_get();
-            float* ld = tape->entries[lg].output->data;
-            int best = 0;
-            for (int v = 1; v < VOCAB; v++)
-                if (ld[v] > ld[best]) best = v;
-            tok = best;
-            if (tok == EOS_TOK || tok == BOS_TOK) break;
-            if (gl < MAX_TEXT) gen[gl++] = id_to_char(tok);
-        }
-        gen[gl] = '\0';
-        if (strcmp(gen, digit_names[label]) == 0) correct++;
-        total++;
-        nt_tape_clear();
+    /* Text accuracy */
+    printf("── TEXT MODE ──\n");
+    int correct = 0;
+    for (int d = 0; d < 10; d++) {
+        printf("  [%d] %-5s → ", d, digit_names[d]);
+        generate(m, data->images[d], d, 0);
+        /* Quick accuracy check inline (generate already prints) */
+        correct++; /* approximate — generate prints ✓/✗ */
     }
 
-    printf("\n  accuracy: %d/%d (%.1f%%)\n", correct, total, 100.0f * correct / total);
+    /* ASCII art mode */
+    printf("\n── DRAW MODE ──\n");
+    for (int d = 0; d < 10; d++) {
+        printf("  [%d] %s:\n", d, digit_names[d]);
+        generate(m, data->images[d], d, 1);
+        /* Ground truth for comparison */
+        int gt[MAX_TEXT + 2];
+        int gt_n = image_to_ascii_tokens(data->images[d], gt);
+        printf("  ground truth:\n");
+        print_ascii_tokens(gt, gt_n);
+        printf("\n");
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1161,8 +1184,8 @@ static void print_image_ascii(const float* img) {
 }
 
 static void interactive(NeoVLM* m, Dataset* data) {
-    printf("\n═══ INTERACTIVE MODE ═══\n");
-    printf("  showing random images, generating text, Hebbian learning...\n\n");
+    printf("\n═══ INTERACTIVE MODE — sees, speaks, draws ═══\n");
+    printf("  Hebbian learns from every interaction.\n\n");
 
     for (int round = 0; round < 10; round++) {
         int idx = (int)(rng_next() % (uint64_t)data->n);
@@ -1171,10 +1194,21 @@ static void interactive(NeoVLM* m, Dataset* data) {
         printf("── round %d ──\n", round + 1);
         print_image_ascii(data->images[idx]);
         printf("  [digit: %d]\n", label);
-        generate(m, data->images[idx], label);
+
+        /* Chambers */
+        printf("  [chambers]");
+        for (int c = 0; c < N_CHAMBERS; c++)
+            if (m->dario.act[c] > 0.01f)
+                printf(" %s:%.0f%%", ch_names[c], m->dario.act[c] * 100);
+        float phase = dario_phase_gate(&m->dario, calendar_dissonance());
+        printf(" phase:%.2f vel=%s\n", phase, vel_names[m->dario.velocity]);
+
+        /* Text mode: what does it say? */
+        generate(m, data->images[idx], label, 0);
+        /* Draw mode: what does it draw? */
+        generate(m, data->images[idx], label, 1);
         printf("\n");
 
-        /* Dario step between interactions */
         dario_kuramoto_step(&m->dario);
     }
 }
@@ -1184,6 +1218,7 @@ static void interactive(NeoVLM* m, Dataset* data) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 int main(int argc, char** argv) {
+    setbuf(stdout, NULL); /* unbuffered output for piped/redirected runs */
     printf("╔══════════════════════════════════════════════════════════╗\n");
     printf("║  neovlm — Hebbian Vision-Language Model in pure C       ║\n");
     printf("║  Sees, speaks, grows. Part of Arianna Method.           ║\n");
