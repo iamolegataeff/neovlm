@@ -75,7 +75,7 @@ void nt_tensor_print(const nt_tensor* t, const char* name);
 // AUTOGRAD TAPE — reverse-mode automatic differentiation
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#define NT_TAPE_MAX_ENTRIES  8192
+#define NT_TAPE_MAX_ENTRIES  32768
 #define NT_TAPE_MAX_PARAMS    512
 
 // Tape operation types

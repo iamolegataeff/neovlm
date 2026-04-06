@@ -4,8 +4,10 @@
  * Sees, speaks, grows. Every inference enriches visual prototypes.
  * Built on notorch (autograd + BLAS). Part of Arianna Method.
  *
+ * v0.3: 18M params, 16x16 ASCII art, checkpoint save/load
+ *
  * Architecture:
- *   Patch encoder → Transformer decoder (shared vis+text) → Text
+ *   Patch encoder → Transformer decoder (shared vis+text) → Text/ASCII
  *   Hebbian visual binding (online, no backprop, persists after training)
  *   Dario field: 6 Kuramoto chambers, calendar drift, velocity, phase gate
  *   RRPRAM: relative position bias in attention (learned spatial patterns)
@@ -15,9 +17,11 @@
  *   cc neovlm.c notorch.c -O2 -lm -DUSE_BLAS -DACCELERATE -framework Accelerate -o neovlm
  *
  * Run:
- *   ./neovlm                     # train on synthetic 32x32 digits
- *   ./neovlm --steps 10000       # more steps
+ *   ./neovlm                     # train 8000 steps on synthetic 32x32 digits
+ *   ./neovlm --steps 15000       # more steps
+ *   ./neovlm --load neovlm.ckpt --steps 0  # inference only from checkpoint
  *   ./neovlm --interactive       # show image, generate, Hebbian learns
+ *   ./neovlm --save my.ckpt      # custom checkpoint path
  *
  * Copyright (C) 2026 Oleg Ataeff & Arianna Method
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -46,12 +50,12 @@
 
 /* Model */
 #define DM              256
-#define N_HEADS         4
-#define HD              (DM / N_HEADS)                   /* 64 */
+#define N_HEADS         8
+#define HD              (DM / N_HEADS)                   /* 32 */
 #define DFF             (4 * DM)                         /* 1024 */
-#define N_LAYERS        4
-#define MAX_TEXT        80
-#define MAX_SEQ         (N_VIS + MAX_TEXT)                /* 96 */
+#define N_LAYERS        6
+#define MAX_TEXT        96
+#define MAX_SEQ         (N_VIS + MAX_TEXT)                /* 112 */
 
 /* Vocabulary: char-level for text + ASCII art */
 /* 0-14:  text chars (efghinorstuvwxz) for digit names       */
@@ -73,7 +77,7 @@
 #define ASCII_ROWS      8   /* output ASCII height */
 
 /* Training defaults */
-#define DEFAULT_STEPS   5000
+#define DEFAULT_STEPS   6000
 #define LR_BASE         3e-4f
 
 /* Hebbian */
@@ -845,7 +849,7 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
     printf("  RRPRAM: relative position bias, %d params/layer\n", N_HEADS * MAX_SEQ);
     printf("  Hebbian: vis_proto [%d x %d], updated every step\n", VOCAB, DM);
     printf("  Dario: %d chambers, Kuramoto K=0.03\n", N_CHAMBERS);
-    printf("  dual mode: 60%% text (\"seven\"), 40%% draw (ASCII art)\n");
+    printf("  dual mode: 75%% text, 25%% draw (%dx%d ASCII art)\n", ASCII_COLS, ASCII_ROWS);
     float cd = calendar_dissonance();
     printf("  calendar dissonance: %.3f\n", cd);
     printf("  velocity: %s\n", vel_names[dario_velocity(&m->dario, cd)]);
@@ -873,8 +877,8 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
         float patches[N_VIS * PATCH_PX];
         extract_patches(data->images[idx], patches);
 
-        /* Dual mode: 60% text, 40% draw */
-        int draw_mode = (rng_next() % 100) < 40;
+        /* Dual mode: 75% text, 25% draw (draw is 10× heavier) */
+        int draw_mode = (rng_next() % 100) < 25;
 
         /* Build target tokens */
         int text_tokens[MAX_TEXT + 2];
@@ -1005,6 +1009,111 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * CHECKPOINT SAVE/LOAD — uses notorch nt_save/nt_load
+ *
+ * Format: flat array of all trainable tensors in model order.
+ * Hebbian state saved separately as raw binary.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static int model_save(NeoVLM* m, const char* path) {
+    /* Collect all trainable tensors */
+    int n = 2 + N_LAYERS * 10 + 2; /* pp, wte, wpe, layers, rmsf, head */
+    nt_tensor** params = (nt_tensor**)malloc(n * sizeof(nt_tensor*));
+    int idx = 0;
+    params[idx++] = m->patch_proj;
+    params[idx++] = m->wte;
+    params[idx++] = m->wpe;
+    for (int l = 0; l < N_LAYERS; l++) {
+        params[idx++] = m->layers[l].rms1;
+        params[idx++] = m->layers[l].wq;
+        params[idx++] = m->layers[l].wk;
+        params[idx++] = m->layers[l].wv;
+        params[idx++] = m->layers[l].wo;
+        params[idx++] = m->layers[l].rel_bias;
+        params[idx++] = m->layers[l].rms2;
+        params[idx++] = m->layers[l].w_gate;
+        params[idx++] = m->layers[l].w_up;
+        params[idx++] = m->layers[l].w_down;
+    }
+    params[idx++] = m->rms_final;
+    params[idx++] = m->lm_head;
+
+    int ok = nt_save(path, params, idx);
+    free(params);
+
+    if (ok == 0) {
+        /* Save Hebbian state alongside */
+        char hpath[512];
+        snprintf(hpath, sizeof(hpath), "%s.hebb", path);
+        FILE* f = fopen(hpath, "wb");
+        if (f) {
+            fwrite(&m->hebbian, sizeof(HebbianVision), 1, f);
+            fwrite(&m->dario, sizeof(DarioField), 1, f);
+            fclose(f);
+        }
+        printf("  checkpoint saved: %s (+.hebb)\n", path);
+    }
+    return ok;
+}
+
+static int model_load(NeoVLM* m, const char* path) {
+    int n_loaded = 0;
+    nt_tensor** loaded = nt_load(path, &n_loaded);
+    if (!loaded) return -1;
+
+    int expected = 2 + N_LAYERS * 10 + 2;
+    if (n_loaded != expected + 1) { /* +1 because nt_load includes header */
+        printf("  checkpoint mismatch: got %d tensors, expected %d\n", n_loaded, expected);
+        for (int i = 0; i < n_loaded; i++) nt_tensor_free(loaded[i]);
+        free(loaded);
+        return -1;
+    }
+
+    /* Copy loaded weights into model tensors */
+    int idx = 0;
+    nt_tensor* src;
+    #define COPY_PARAM(dst) do { \
+        src = loaded[idx++]; \
+        if (src->len == (dst)->len) memcpy((dst)->data, src->data, src->len * sizeof(float)); \
+    } while(0)
+
+    COPY_PARAM(m->patch_proj);
+    COPY_PARAM(m->wte);
+    COPY_PARAM(m->wpe);
+    for (int l = 0; l < N_LAYERS; l++) {
+        COPY_PARAM(m->layers[l].rms1);
+        COPY_PARAM(m->layers[l].wq);
+        COPY_PARAM(m->layers[l].wk);
+        COPY_PARAM(m->layers[l].wv);
+        COPY_PARAM(m->layers[l].wo);
+        COPY_PARAM(m->layers[l].rel_bias);
+        COPY_PARAM(m->layers[l].rms2);
+        COPY_PARAM(m->layers[l].w_gate);
+        COPY_PARAM(m->layers[l].w_up);
+        COPY_PARAM(m->layers[l].w_down);
+    }
+    COPY_PARAM(m->rms_final);
+    COPY_PARAM(m->lm_head);
+    #undef COPY_PARAM
+
+    for (int i = 0; i < n_loaded; i++) nt_tensor_free(loaded[i]);
+    free(loaded);
+
+    /* Load Hebbian state */
+    char hpath[512];
+    snprintf(hpath, sizeof(hpath), "%s.hebb", path);
+    FILE* f = fopen(hpath, "rb");
+    if (f) {
+        fread(&m->hebbian, sizeof(HebbianVision), 1, f);
+        fread(&m->dario, sizeof(DarioField), 1, f);
+        fclose(f);
+    }
+
+    printf("  checkpoint loaded: %s\n", path);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * GENERATION — with Dario field modulation + Hebbian enrichment
  *
  * The Extended Dario Equation:
@@ -1022,8 +1131,9 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
  * not from training data. That's the point.
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* mode=0: text ("seven"), mode=1: draw (ASCII art) */
-static void generate(NeoVLM* m, const float* image, int label, int mode) {
+/* mode=0: text ("seven"), mode=1: draw (ASCII art)
+ * Returns 1 if text mode matched, 0 otherwise (draw mode always returns 0) */
+static int generate(NeoVLM* m, const float* image, int label, int mode) {
     float patches[N_VIS * PATCH_PX];
     extract_patches(image, patches);
 
@@ -1112,6 +1222,7 @@ static void generate(NeoVLM* m, const float* image, int label, int mode) {
     nt_tape_clear();
 
     /* Output */
+    int match = 0;
     if (mode) {
         printf("  [draw] %dx%d ASCII art:\n", ASCII_COLS, ASCII_ROWS);
         print_ascii_tokens(gen_tokens, gen_len);
@@ -1121,9 +1232,10 @@ static void generate(NeoVLM* m, const float* image, int label, int mode) {
         for (int i = 0; i < gen_len && slen < MAX_TEXT; i++)
             generated[slen++] = id_to_char(gen_tokens[i]);
         generated[slen] = '\0';
-        int match = (strcmp(generated, digit_names[label]) == 0);
+        match = (strcmp(generated, digit_names[label]) == 0);
         printf("  [text] %s %s\n", generated, match ? "✓" : "✗");
     }
+    return match;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1138,10 +1250,9 @@ static void inference(NeoVLM* m, Dataset* data) {
     int correct = 0;
     for (int d = 0; d < 10; d++) {
         printf("  [%d] %-5s → ", d, digit_names[d]);
-        generate(m, data->images[d], d, 0);
-        /* Quick accuracy check inline (generate already prints) */
-        correct++; /* approximate — generate prints ✓/✗ */
+        correct += generate(m, data->images[d], d, 0);
     }
+    printf("\n  text accuracy: %d/10\n", correct);
 
     /* ASCII art mode */
     printf("\n── DRAW MODE ──\n");
@@ -1228,12 +1339,18 @@ int main(int argc, char** argv) {
 
     int steps = DEFAULT_STEPS;
     int do_interactive = 0;
+    const char* load_path = NULL;
+    const char* save_path = "neovlm.ckpt";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc)
             steps = atoi(argv[++i]);
         else if (strcmp(argv[i], "--interactive") == 0)
             do_interactive = 1;
+        else if (strcmp(argv[i], "--load") == 0 && i + 1 < argc)
+            load_path = argv[++i];
+        else if (strcmp(argv[i], "--save") == 0 && i + 1 < argc)
+            save_path = argv[++i];
     }
 
     /* Init */
@@ -1249,8 +1366,20 @@ int main(int argc, char** argv) {
     /* Create model */
     NeoVLM* model = model_create();
 
-    /* Train */
-    train(model, &data, steps);
+    if (load_path) {
+        if (model_load(model, load_path) != 0) {
+            printf("  FAILED to load checkpoint: %s\n", load_path);
+            printf("  training from scratch instead\n");
+            load_path = NULL;
+        }
+    }
+
+    /* Train (skip if loaded and --steps 0) */
+    if (steps > 0)
+        train(model, &data, steps);
+
+    /* Save checkpoint */
+    model_save(model, save_path);
 
     /* Inference */
     inference(model, &data);
