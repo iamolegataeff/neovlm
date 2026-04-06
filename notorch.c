@@ -2105,6 +2105,272 @@ int nt_seq_layernorm(int x_idx, int gamma_idx, int beta_idx, int T, int D) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// DIFFUSION OPS — Conv2d, GroupNorm, cross-attention, upsample
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Static im2col buffer (reused, never shrinks)
+static float* s_im2col_buf = NULL;
+static size_t s_im2col_cap = 0;
+
+int nt_conv2d(int input_idx, int weight_idx, int bias_idx, int stride, int padding) {
+    if (input_idx < 0 || weight_idx < 0) return -1;
+    nt_tape_entry* pi = &g_tape.entries[input_idx];
+    nt_tape_entry* pw = &g_tape.entries[weight_idx];
+
+    int Cin  = pi->output->shape[1];
+    int Hin  = pi->output->shape[2];
+    int Win  = pi->output->shape[3];
+    int Cout = pw->output->shape[0];
+    int kH   = pw->output->shape[2];
+    int kW   = pw->output->shape[3];
+    int Hout = (Hin + 2*padding - kH) / stride + 1;
+    int Wout = (Win + 2*padding - kW) / stride + 1;
+    int spatial = Hout * Wout;
+
+    int shape[4] = {1, Cout, Hout, Wout};
+    nt_tensor* out = nt_tensor_new_shape(shape, 4);
+    if (!out) return -1;
+
+    float* input_data = pi->output->data;
+    float* W = pw->output->data;
+
+    if (kH == 1 && kW == 1 && stride == 1 && padding == 0) {
+        // 1x1 conv = matrix multiply: out[Cout, spatial] = W[Cout, Cin] @ input[Cin, spatial]
+#ifdef USE_BLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    Cout, spatial, Cin, 1.0f, W, Cin, input_data, spatial,
+                    0.0f, out->data, spatial);
+#else
+        for (int co = 0; co < Cout; co++)
+            for (int s = 0; s < spatial; s++) {
+                float sum = 0;
+                for (int ci = 0; ci < Cin; ci++)
+                    sum += W[co*Cin + ci] * input_data[ci*spatial + s];
+                out->data[co*spatial + s] = sum;
+            }
+#endif
+    } else {
+        // im2col + GEMM
+        int col_rows = Cin * kH * kW;
+        int col_cols = spatial;
+        size_t col_size = (size_t)col_rows * col_cols;
+        if (col_size > s_im2col_cap) {
+            free(s_im2col_buf);
+            s_im2col_buf = (float*)malloc(col_size * sizeof(float));
+            s_im2col_cap = col_size;
+        }
+        // im2col
+        for (int c = 0; c < Cin; c++)
+            for (int kh = 0; kh < kH; kh++)
+                for (int kw = 0; kw < kW; kw++) {
+                    int row = (c * kH + kh) * kW + kw;
+                    for (int oh = 0; oh < Hout; oh++)
+                        for (int ow = 0; ow < Wout; ow++) {
+                            int ih = oh * stride - padding + kh;
+                            int iw = ow * stride - padding + kw;
+                            float val = 0.0f;
+                            if (ih >= 0 && ih < Hin && iw >= 0 && iw < Win)
+                                val = input_data[(c * Hin + ih) * Win + iw];
+                            s_im2col_buf[row * col_cols + oh * Wout + ow] = val;
+                        }
+                }
+        // GEMM: out[Cout, spatial] = W[Cout, col_rows] @ col[col_rows, spatial]
+#ifdef USE_BLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    Cout, col_cols, col_rows, 1.0f, W, col_rows,
+                    s_im2col_buf, col_cols, 0.0f, out->data, col_cols);
+#else
+        for (int co = 0; co < Cout; co++)
+            for (int s = 0; s < col_cols; s++) {
+                float sum = 0;
+                for (int k = 0; k < col_rows; k++)
+                    sum += W[co*col_rows + k] * s_im2col_buf[k*col_cols + s];
+                out->data[co*col_cols + s] = sum;
+            }
+#endif
+    }
+
+    // Add bias
+    if (bias_idx >= 0) {
+        nt_tape_entry* pb = &g_tape.entries[bias_idx];
+        for (int co = 0; co < Cout; co++) {
+            float b = pb->output->data[co];
+            for (int s = 0; s < spatial; s++)
+                out->data[co * spatial + s] += b;
+        }
+    }
+
+    int idx = nt_tape_record3(out, NT_OP_CONV2D, input_idx, weight_idx, bias_idx,
+                              (float)stride, (float)padding);
+    nt_tensor_free(out);
+    return idx;
+}
+
+int nt_groupnorm(int x_idx, int weight_idx, int bias_idx, int num_groups, float eps) {
+    if (x_idx < 0) return -1;
+    nt_tape_entry* px = &g_tape.entries[x_idx];
+    int C = px->output->shape[1];
+    int H = px->output->shape[2];
+    int W = px->output->shape[3];
+    int groupSize = C / num_groups;
+    int spatial = H * W;
+
+    int shape[4] = {1, C, H, W};
+    nt_tensor* out = nt_tensor_new_shape(shape, 4);
+    if (!out) return -1;
+
+    float* xd = px->output->data;
+    float* wd = (weight_idx >= 0) ? g_tape.entries[weight_idx].output->data : NULL;
+    float* bd = (bias_idx >= 0) ? g_tape.entries[bias_idx].output->data : NULL;
+
+    for (int g = 0; g < num_groups; g++) {
+        int cs = g * groupSize;
+        int ce = cs + groupSize;
+        int count = groupSize * spatial;
+
+        float mean = 0;
+        for (int c = cs; c < ce; c++)
+            for (int i = 0; i < spatial; i++)
+                mean += xd[c * spatial + i];
+        mean /= count;
+
+        float var = 0;
+        for (int c = cs; c < ce; c++)
+            for (int i = 0; i < spatial; i++) {
+                float d = xd[c * spatial + i] - mean;
+                var += d * d;
+            }
+        var /= count;
+        float inv = 1.0f / sqrtf(var + eps);
+
+        for (int c = cs; c < ce; c++)
+            for (int i = 0; i < spatial; i++) {
+                float v = (xd[c * spatial + i] - mean) * inv;
+                if (wd) v = v * wd[c] + bd[c];
+                out->data[c * spatial + i] = v;
+            }
+    }
+
+    int idx = nt_tape_record3(out, NT_OP_GROUPNORM, x_idx, weight_idx, bias_idx,
+                              (float)num_groups, eps);
+    nt_tensor_free(out);
+    return idx;
+}
+
+int nt_cross_attention(int q_idx, int k_idx, int v_idx, int seqQ, int seqKV, int head_dim) {
+    if (q_idx < 0 || k_idx < 0 || v_idx < 0) return -1;
+    nt_tape_entry* pq = &g_tape.entries[q_idx];
+    nt_tape_entry* pk = &g_tape.entries[k_idx];
+    nt_tape_entry* pv = &g_tape.entries[v_idx];
+    int dim = pq->output->len / seqQ;
+    int numHeads = dim / head_dim;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    nt_tensor* out = nt_tensor_new2d(seqQ, dim);
+    if (!out) return -1;
+
+    float* Q = pq->output->data;
+    float* K = pk->output->data;
+    float* V = pv->output->data;
+
+    // Per-head attention (no causal mask)
+    for (int h = 0; h < numHeads; h++) {
+        int off = h * head_dim;
+        float* scores = (float*)calloc(seqKV, sizeof(float));
+        for (int i = 0; i < seqQ; i++) {
+            float maxS = -1e30f;
+            for (int j = 0; j < seqKV; j++) {
+                float s = 0;
+                for (int d = 0; d < head_dim; d++)
+                    s += Q[i*dim + off + d] * K[j*dim + off + d];
+                scores[j] = s * scale;
+                if (scores[j] > maxS) maxS = scores[j];
+            }
+            float sumE = 0;
+            for (int j = 0; j < seqKV; j++) {
+                scores[j] = expf(scores[j] - maxS);
+                sumE += scores[j];
+            }
+            for (int j = 0; j < seqKV; j++) scores[j] /= sumE;
+            for (int d = 0; d < head_dim; d++) {
+                float s = 0;
+                for (int j = 0; j < seqKV; j++)
+                    s += scores[j] * V[j*dim + off + d];
+                out->data[i*dim + off + d] = s;
+            }
+        }
+        free(scores);
+    }
+
+    int idx = nt_tape_record3(out, NT_OP_CROSS_ATTN, q_idx, k_idx, v_idx,
+                              (float)seqQ, (float)head_dim);
+    nt_tensor_free(out);
+    return idx;
+}
+
+int nt_upsample2x(int x_idx, int C, int H, int W) {
+    if (x_idx < 0) return -1;
+    nt_tape_entry* px = &g_tape.entries[x_idx];
+
+    int shape[4] = {1, C, H*2, W*2};
+    nt_tensor* out = nt_tensor_new_shape(shape, 4);
+    if (!out) return -1;
+
+    float* xd = px->output->data;
+    for (int c = 0; c < C; c++)
+        for (int h = 0; h < H; h++)
+            for (int w = 0; w < W; w++) {
+                float v = xd[(c*H + h)*W + w];
+                int H2 = H*2, W2 = W*2;
+                out->data[(c*H2 + h*2)*W2 + w*2] = v;
+                out->data[(c*H2 + h*2)*W2 + w*2+1] = v;
+                out->data[(c*H2 + h*2+1)*W2 + w*2] = v;
+                out->data[(c*H2 + h*2+1)*W2 + w*2+1] = v;
+            }
+
+    int idx = nt_tape_record3(out, NT_OP_UPSAMPLE2X, x_idx, -1, -1, (float)C, (float)H);
+    nt_tensor_free(out);
+    return idx;
+}
+
+int nt_concat_channels(int a_idx, int b_idx, int C1, int C2, int H, int W) {
+    if (a_idx < 0 || b_idx < 0) return -1;
+    nt_tape_entry* pa = &g_tape.entries[a_idx];
+    nt_tape_entry* pb = &g_tape.entries[b_idx];
+
+    int shape[4] = {1, C1+C2, H, W};
+    nt_tensor* out = nt_tensor_new_shape(shape, 4);
+    if (!out) return -1;
+
+    int spatial = H * W;
+    float* ad = pa->output->data;
+    float* bd = pb->output->data;
+    for (int c = 0; c < C1; c++)
+        memcpy(out->data + c*spatial, ad + c*spatial, spatial*sizeof(float));
+    for (int c = 0; c < C2; c++)
+        memcpy(out->data + (C1+c)*spatial, bd + c*spatial, spatial*sizeof(float));
+
+    int idx = nt_tape_record3(out, NT_OP_CONCAT_CH, a_idx, b_idx, -1, (float)C1, (float)C2);
+    nt_tensor_free(out);
+    return idx;
+}
+
+int nt_quick_gelu(int x_idx) {
+    if (x_idx < 0) return -1;
+    nt_tape_entry* px = &g_tape.entries[x_idx];
+    int n = px->output->len;
+    nt_tensor* out = nt_tensor_new(n);
+    if (!out) return -1;
+    for (int i = 0; i < n; i++) {
+        float v = px->output->data[i];
+        out->data[i] = v * (1.0f / (1.0f + expf(-1.702f * v)));
+    }
+    int idx = nt_tape_record(out, NT_OP_QUICK_GELU, x_idx, -1, 0);
+    nt_tensor_free(out);
+    return idx;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // BPE TOKENIZER
 // ═══════════════════════════════════════════════════════════════════════════════
 

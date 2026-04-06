@@ -23,7 +23,7 @@ extern "C" {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #define NT_MAX_DIMS     8
-#define NT_MAX_ELEMENTS (1 << 24)  // 16M floats max per tensor
+#define NT_MAX_ELEMENTS (1 << 26)  // 64M floats max per tensor (diffusion needs large 4D)
 
 typedef struct {
     float*   data;              // CPU data (heap-allocated)
@@ -102,6 +102,12 @@ void nt_tensor_print(const nt_tensor* t, const char* name);
 #define NT_OP_LAYERNORM      20   // (x - mean) / sqrt(var + eps) * gamma + beta
 #define NT_OP_SEQ_LAYERNORM  21   // layernorm per position
 #define NT_OP_GELU           22   // GELU activation
+#define NT_OP_CONV2D         23   // 2D convolution (im2col + GEMM)
+#define NT_OP_GROUPNORM      24   // GroupNorm [N,C,H,W]
+#define NT_OP_CROSS_ATTN     25   // cross-attention (Q from latent, K/V from context)
+#define NT_OP_UPSAMPLE2X     26   // nearest-neighbor 2x upsample
+#define NT_OP_CONCAT_CH      27   // concat along channel dim
+#define NT_OP_QUICK_GELU     28   // x * sigmoid(1.702 * x) — CLIP
 
 typedef struct {
     nt_tensor* output;          // forward result
@@ -336,6 +342,31 @@ int nt_seq_layernorm(int x_idx, int gamma_idx, int beta_idx, int T, int D);
 
 // GELU activation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
 int nt_gelu(int x_idx);
+
+// QuickGELU: x * sigmoid(1.702 * x) — used by CLIP
+int nt_quick_gelu(int x_idx);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DIFFUSION OPS — Conv2d, GroupNorm, cross-attention, upsample
+// For UNet / VAE / CLIP inference (yent.yo, neovlm)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Conv2d: input [N,Cin,H,W], weight [Cout,Cin,kH,kW], bias [Cout]
+// Uses im2col + cblas_sgemm. Returns tape index.
+int nt_conv2d(int input_idx, int weight_idx, int bias_idx, int stride, int padding);
+
+// GroupNorm: x [N,C,H,W], weight [C], bias [C], num_groups, eps
+int nt_groupnorm(int x_idx, int weight_idx, int bias_idx, int num_groups, float eps);
+
+// Cross-attention: Q from query [seqQ, dim], K/V from context [seqKV, dim]
+// Multi-head, headDim specified. NOT causal.
+int nt_cross_attention(int q_idx, int k_idx, int v_idx, int seqQ, int seqKV, int head_dim);
+
+// Upsample 2x: nearest-neighbor [N,C,H,W] → [N,C,2H,2W]
+int nt_upsample2x(int x_idx, int C, int H, int W);
+
+// Concat along channel dim: [N,C1,H,W] + [N,C2,H,W] → [N,C1+C2,H,W]
+int nt_concat_channels(int a_idx, int b_idx, int C1, int C2, int H, int W);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PROFILER — op timing + memory tracking

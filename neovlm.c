@@ -77,7 +77,7 @@
 #define ASCII_ROWS      8   /* output ASCII height */
 
 /* Training defaults */
-#define DEFAULT_STEPS   6000
+#define DEFAULT_STEPS   8000
 #define LR_BASE         3e-4f
 
 /* Hebbian */
@@ -849,7 +849,7 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
     printf("  RRPRAM: relative position bias, %d params/layer\n", N_HEADS * MAX_SEQ);
     printf("  Hebbian: vis_proto [%d x %d], updated every step\n", VOCAB, DM);
     printf("  Dario: %d chambers, Kuramoto K=0.03\n", N_CHAMBERS);
-    printf("  dual mode: 75%% text, 25%% draw (%dx%d ASCII art)\n", ASCII_COLS, ASCII_ROWS);
+    printf("  dual mode: 65%% text, 35%% draw (%dx%d ASCII art, draw ×1.5 weight)\n", ASCII_COLS, ASCII_ROWS);
     float cd = calendar_dissonance();
     printf("  calendar dissonance: %.3f\n", cd);
     printf("  velocity: %s\n", vel_names[dario_velocity(&m->dario, cd)]);
@@ -877,8 +877,8 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
         float patches[N_VIS * PATCH_PX];
         extract_patches(data->images[idx], patches);
 
-        /* Dual mode: 75% text, 25% draw (draw is 10× heavier) */
-        int draw_mode = (rng_next() % 100) < 25;
+        /* Dual mode: 65% text, 35% draw */
+        int draw_mode = (rng_next() % 100) < 35;
 
         /* Build target tokens */
         int text_tokens[MAX_TEXT + 2];
@@ -937,11 +937,12 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
         /* Bind last target token too */
         hebbian_bind(&m->hebbian, text_tokens[n_text - 1], vis_ctx);
 
-        /* Average loss */
+        /* Average loss (draw mode weighted ×1.5 for sharper ASCII art) */
         int total_loss = loss_indices[0];
         for (int i = 1; i < n_losses; i++)
             total_loss = nt_add(total_loss, loss_indices[i]);
-        int avg_loss = nt_scale(total_loss, 1.0f / n_losses);
+        float loss_weight = draw_mode ? 1.5f / n_losses : 1.0f / n_losses;
+        int avg_loss = nt_scale(total_loss, loss_weight);
 
         float loss_val = nt_tape_get()->entries[avg_loss].output->data[0];
         if (step == 0) first_loss = loss_val;
@@ -1204,6 +1205,20 @@ static int generate(NeoVLM* m, const float* image, int label, int mode) {
         temp *= d_temp * vel_t;
         if (temp < 0.1f) temp = 0.1f;
         for (int v = 0; v < VOCAB; v++) logits[v] /= temp;
+
+        /* In draw mode, suppress EOS until we've drawn enough */
+        if (mode) {
+            int min_draw = ASCII_COLS * ASCII_ROWS + (ASCII_ROWS - 1); /* pixels + newlines */
+            if (gen_len < min_draw)
+                logits[EOS_TOK] = -1e9f;
+            /* Also suppress text chars in draw mode, shades only */
+            for (int v = 0; v < BOS_TOK; v++)
+                logits[v] = -1e9f;
+        } else {
+            /* In text mode, suppress shade/draw tokens */
+            for (int v = SHADE_START; v <= BOS_DRAW; v++)
+                logits[v] = -1e9f;
+        }
 
         /* Greedy decode */
         int best = 0;
