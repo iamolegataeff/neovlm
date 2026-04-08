@@ -58,26 +58,26 @@
 #define MAX_SEQ         (N_VIS + MAX_TEXT)                /* 112 */
 
 /* Vocabulary: char-level for text + ASCII art */
-/* 0-14:  text chars (efghinorstuvwxz) for digit names       */
-/* 15:    BOS_TEXT (text generation mode)                     */
-/* 16:    EOS (end of sequence)                               */
-/* 17-26: ASCII shade chars " .:-=+*#%@" (10 brightness levels) */
-/* 27:    NEWLINE (row separator in ASCII art)                */
-/* 28:    BOS_DRAW (ASCII art generation mode)                */
-#define VOCAB           29
-#define BOS_TOK         15  /* text mode start */
-#define EOS_TOK         16
-#define SHADE_START     17  /* first ASCII shade token */
-#define SHADE_END       26  /* last ASCII shade token */
-#define NL_TOK          27  /* newline in ASCII art */
-#define BOS_DRAW        28  /* draw mode start */
+/* 0-17:  text chars (acefghilnorstuvwxz) for object names   */
+/* 18:    BOS_TEXT (text generation mode)                     */
+/* 19:    EOS (end of sequence)                               */
+/* 20-29: ASCII shade chars " .:-=+*#%@" (10 brightness levels) */
+/* 30:    NEWLINE (row separator in ASCII art)                */
+/* 31:    BOS_DRAW (ASCII art generation mode)                */
+#define VOCAB           32
+#define BOS_TOK         18  /* text mode start */
+#define EOS_TOK         19
+#define SHADE_START     20  /* first ASCII shade token */
+#define SHADE_END       29  /* last ASCII shade token */
+#define NL_TOK          30  /* newline in ASCII art */
+#define BOS_DRAW        31  /* draw mode start */
 
 /* ASCII art config */
 #define ASCII_COLS      8   /* output ASCII width */
 #define ASCII_ROWS      8   /* output ASCII height */
 
 /* Training defaults */
-#define DEFAULT_STEPS   8000
+#define DEFAULT_STEPS   20000
 #define LR_BASE         3e-4f
 
 /* Hebbian */
@@ -293,15 +293,20 @@ static void velocity_multipliers(int vel, float* temp, float* heb, float* pro) {
 }
 
 /* Activate chambers based on visual content */
-static void dario_feel_vision(DarioField* d, int digit) {
-    /* Simple: different digits activate different chambers */
+static void dario_feel_vision(DarioField* d, int label) {
     d->act[CH_FLOW] += 0.05f;     /* seeing anything = flow */
-    if (digit == 0 || digit == 8)  /* round shapes */
+    if (label == 0 || label == 8 || label == 15)  /* round: zero, eight, circle */
         d->act[CH_LOVE] += 0.04f;
-    if (digit == 1 || digit == 7)  /* sharp shapes */
+    if (label == 1 || label == 7 || label == 11)  /* sharp: one, seven, arrow */
         d->act[CH_CMPLX] += 0.03f;
-    if (digit == 4 || digit == 9)  /* angular shapes */
+    if (label == 4 || label == 9 || label == 13)  /* angular: four, nine, cross */
         d->act[CH_FEAR] += 0.02f;
+    if (label == 10)                              /* house = warmth */
+        d->act[CH_LOVE] += 0.06f;
+    if (label == 14)                              /* heart */
+        d->act[CH_LOVE] += 0.08f;
+    if (label == 12)                              /* star = complexity */
+        d->act[CH_CMPLX] += 0.05f;
     for (int i = 0; i < N_CHAMBERS; i++)
         d->act[i] = clampf(d->act[i], 0.0f, 1.0f);
 }
@@ -361,20 +366,22 @@ static float visual_prophecy(const HebbianVision* hv, int token, const float* vi
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * TEXT TOKENIZER — char-level for MNIST digit names
+ * TEXT TOKENIZER — char-level for object names
  * ═══════════════════════════════════════════════════════════════════ */
 
 static const char* digit_names[] = {
     "zero", "one", "two", "three", "four",
-    "five", "six", "seven", "eight", "nine"
+    "five", "six", "seven", "eight", "nine",
+    "house", "arrow", "star", "cross", "heart", "circle"
 };
+#define N_OBJECTS 16 /* 10 digits + 6 shapes */
 
-static const char text_chars[] = "efghinorstuvwxz"; /* 15 chars */
+static const char text_chars[] = "efghinorstuvwxzacl"; /* 18 chars: original 15 + acl at end */
 
 static const char ascii_shades[] = " .:-=+*#%@"; /* 10 levels, index 0-9 */
 
 static int char_to_id(char ch) {
-    for (int i = 0; i < 15; i++)
+    for (int i = 0; i < 18; i++)
         if (text_chars[i] == ch) return i;
     return -1;
 }
@@ -386,7 +393,7 @@ static char id_to_char(int id) {
     if (id == NL_TOK) return '\n';
     if (id >= SHADE_START && id <= SHADE_END)
         return ascii_shades[id - SHADE_START];
-    if (id >= 0 && id < 15) return text_chars[id];
+    if (id >= 0 && id < 18) return text_chars[id];
     return '?';
 }
 
@@ -489,6 +496,30 @@ static const float digit_patterns_8x8[10][64] = {
     {0,.5,.8,.8,.5,0,0,0, .8,0,0,0,.8,0,0,0, .8,0,0,0,.8,0,0,0,
      0,.5,.8,.8,.8,0,0,0, 0,0,0,0,.8,0,0,0, 0,0,0,0,.8,0,0,0,
      0,0,0,.5,.8,0,0,0, 0,.5,.8,.8,.5,0,0,0},
+    /* 10: house — triangle roof + square body */
+    {0,0,0,.8,0,0,0,0, 0,0,.8,.5,.8,0,0,0, 0,.8,0,0,0,.8,0,0,
+     .8,.5,0,0,0,.5,.8,0, .8,0,0,.8,0,0,.8,0, .8,0,0,.8,0,0,.8,0,
+     .8,0,0,0,0,0,.8,0, .8,.8,.8,.8,.8,.8,.8,0},
+    /* 11: arrow — pointing right */
+    {0,0,0,.8,0,0,0,0, 0,0,0,0,.8,0,0,0, 0,0,0,0,0,.8,0,0,
+     .8,.8,.8,.8,.8,.8,.8,0, .8,.8,.8,.8,.8,.8,.8,0, 0,0,0,0,0,.8,0,0,
+     0,0,0,0,.8,0,0,0, 0,0,0,.8,0,0,0,0},
+    /* 12: star — 5-pointed */
+    {0,0,0,.8,0,0,0,0, 0,0,.5,.8,.5,0,0,0, .8,.8,.8,.8,.8,.8,.8,0,
+     0,.5,.8,.8,.8,.5,0,0, 0,.8,.5,0,.5,.8,0,0, 0,.8,0,0,0,.8,0,0,
+     .8,.5,0,0,0,.5,.8,0, .8,0,0,0,0,0,.8,0},
+    /* 13: cross — plus sign */
+    {0,0,0,.8,0,0,0,0, 0,0,0,.8,0,0,0,0, 0,0,0,.8,0,0,0,0,
+     .8,.8,.8,.8,.8,.8,.8,0, .8,.8,.8,.8,.8,.8,.8,0, 0,0,0,.8,0,0,0,0,
+     0,0,0,.8,0,0,0,0, 0,0,0,.8,0,0,0,0},
+    /* 14: heart */
+    {0,.8,.8,0,.8,.8,0,0, .8,.5,.5,.8,.5,.5,.8,0, .8,.5,.5,.5,.5,.5,.8,0,
+     .8,.5,.5,.5,.5,.5,.8,0, 0,.8,.5,.5,.5,.8,0,0, 0,0,.8,.5,.8,0,0,0,
+     0,0,0,.8,0,0,0,0, 0,0,0,0,0,0,0,0},
+    /* 15: circle — filled */
+    {0,0,.8,.8,.8,0,0,0, 0,.8,.5,.5,.5,.8,0,0, .8,.5,.5,.5,.5,.5,.8,0,
+     .8,.5,.5,.5,.5,.5,.8,0, .8,.5,.5,.5,.5,.5,.8,0, 0,.8,.5,.5,.5,.8,0,0,
+     0,0,.8,.8,.8,0,0,0, 0,0,0,0,0,0,0,0},
 };
 
 typedef struct {
@@ -504,7 +535,7 @@ static Dataset generate_data(int n_samples) {
     data.labels = (int*)malloc(n_samples * sizeof(int));
     data.images = (float**)malloc(n_samples * sizeof(float*));
     for (int i = 0; i < n_samples; i++) {
-        int label = i % 10;
+        int label = i % N_OBJECTS;
         data.labels[i] = label;
         data.images[i] = (float*)malloc(IMG_SIZE * IMG_SIZE * sizeof(float));
         for (int y = 0; y < IMG_SIZE; y++) {
@@ -845,11 +876,12 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
     printf("  sequence: %d vision + %d text/draw = %d max\n", N_VIS, MAX_TEXT, MAX_SEQ);
     long np = count_params(m);
     printf("  params: %ld (%.2fM, %.2f MB)\n", np, np / 1e6f, np * 4.0f / 1048576.0f);
-    printf("  vocab: %d (15 text + 10 ASCII shades + BOS_TEXT + BOS_DRAW + EOS + NL)\n", VOCAB);
+    printf("  vocab: %d (18 text + 10 ASCII shades + BOS_TEXT + BOS_DRAW + EOS + NL)\n", VOCAB);
+    printf("  objects: %d (10 digits + house, arrow, star, cross, heart, circle)\n", N_OBJECTS);
     printf("  RRPRAM: relative position bias, %d params/layer\n", N_HEADS * MAX_SEQ);
     printf("  Hebbian: vis_proto [%d x %d], updated every step\n", VOCAB, DM);
     printf("  Dario: %d chambers, Kuramoto K=0.03\n", N_CHAMBERS);
-    printf("  dual mode: 65%% text, 35%% draw (%dx%d ASCII art, draw ×1.5 weight)\n", ASCII_COLS, ASCII_ROWS);
+    printf("  dual mode: 60%% text, 40%% draw (%dx%d ASCII art, draw ×1.5 weight)\n", ASCII_COLS, ASCII_ROWS);
     float cd = calendar_dissonance();
     printf("  calendar dissonance: %.3f\n", cd);
     printf("  velocity: %s\n", vel_names[dario_velocity(&m->dario, cd)]);
@@ -877,8 +909,8 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
         float patches[N_VIS * PATCH_PX];
         extract_patches(data->images[idx], patches);
 
-        /* Dual mode: 65% text, 35% draw */
-        int draw_mode = (rng_next() % 100) < 35;
+        /* Dual mode: 60% text, 40% draw */
+        int draw_mode = (rng_next() % 100) < 40;
 
         /* Build target tokens */
         int text_tokens[MAX_TEXT + 2];
@@ -969,7 +1001,7 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
         if (draw_mode) { running_loss_draw += loss_val; count_draw++; }
         else { running_loss_text += loss_val; count_text++; }
 
-        if ((step + 1) % 200 == 0 || step == 0) {
+        if ((step + 1) % 500 == 0 || step == 0) {
             double elapsed = (now_ms() - t0) / 1000.0;
             printf("  step %4d | train %.4f | text %.4f | draw %.4f | lr %.2e | %.1fs | %s %s\n",
                    step + 1, loss_val,
@@ -1190,13 +1222,13 @@ static int generate(NeoVLM* m, const float* image, int label, int mode) {
         float logits[VOCAB];
         memcpy(logits, tape->entries[logits_idx].output->data, VOCAB * sizeof(float));
 
-        /* Hebbian + prophecy injection (text mode only) */
+        /* Hebbian + prophecy injection (text mode only, gentle) */
         if (!mode) {
             for (int v = 0; v < VOCAB; v++) {
                 float heb = hebbian_score(&m->hebbian, v, vis_ctx);
                 float pro = visual_prophecy(&m->hebbian, v, vis_ctx);
-                logits[v] += d_alpha * vel_h * heb * 2.0f +
-                             d_beta * vel_p * pro * 1.5f;
+                logits[v] += d_alpha * vel_h * heb * 0.1f +
+                             d_beta * vel_p * pro * 0.05f;
             }
         }
 
@@ -1263,16 +1295,16 @@ static void inference(NeoVLM* m, Dataset* data) {
     /* Text accuracy */
     printf("── TEXT MODE ──\n");
     int correct = 0;
-    for (int d = 0; d < 10; d++) {
-        printf("  [%d] %-5s → ", d, digit_names[d]);
+    for (int d = 0; d < N_OBJECTS; d++) {
+        printf("  [%2d] %-6s → ", d, digit_names[d]);
         correct += generate(m, data->images[d], d, 0);
     }
-    printf("\n  text accuracy: %d/10\n", correct);
+    printf("\n  text accuracy: %d/%d\n", correct, N_OBJECTS);
 
     /* ASCII art mode */
     printf("\n── DRAW MODE ──\n");
-    for (int d = 0; d < 10; d++) {
-        printf("  [%d] %s:\n", d, digit_names[d]);
+    for (int d = 0; d < N_OBJECTS; d++) {
+        printf("  [%2d] %s:\n", d, digit_names[d]);
         generate(m, data->images[d], d, 1);
         /* Ground truth for comparison */
         int gt[MAX_TEXT + 2];
@@ -1374,7 +1406,7 @@ int main(int argc, char** argv) {
 
     /* Generate data */
     printf("generating synthetic 32x32 digit patterns...\n");
-    Dataset data = generate_data(10000);
+    Dataset data = generate_data(16000);
     printf("generated %d images, %dx%d, %d patches of %dx%d\n\n",
            data.n, IMG_SIZE, IMG_SIZE, N_VIS, PATCH_SIZE, PATCH_SIZE);
 
