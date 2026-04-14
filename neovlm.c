@@ -30,6 +30,7 @@
  */
 
 #include "notorch.h"
+#include "notorch_vision.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,35 +50,35 @@
 #define PATCH_PX        (PATCH_SIZE * PATCH_SIZE)        /* 64 */
 
 /* Model */
-#define DM              256
+#define DM              320
 #define N_HEADS         8
-#define HD              (DM / N_HEADS)                   /* 32 */
-#define DFF             (4 * DM)                         /* 1024 */
+#define HD              (DM / N_HEADS)                   /* 40 */
+#define DFF             (4 * DM)                         /* 1280 */
 #define N_LAYERS        6
 #define MAX_TEXT        96
 #define MAX_SEQ         (N_VIS + MAX_TEXT)                /* 112 */
 
 /* Vocabulary: char-level for text + ASCII art */
-/* 0-17:  text chars (acefghilnorstuvwxz) for object names   */
-/* 18:    BOS_TEXT (text generation mode)                     */
-/* 19:    EOS (end of sequence)                               */
-/* 20-29: ASCII shade chars " .:-=+*#%@" (10 brightness levels) */
-/* 30:    NEWLINE (row separator in ASCII art)                */
-/* 31:    BOS_DRAW (ASCII art generation mode)                */
-#define VOCAB           32
-#define BOS_TOK         18  /* text mode start */
-#define EOS_TOK         19
-#define SHADE_START     20  /* first ASCII shade token */
-#define SHADE_END       29  /* last ASCII shade token */
-#define NL_TOK          30  /* newline in ASCII art */
-#define BOS_DRAW        31  /* draw mode start */
+/* 0-25:  text chars (efghinorstuvwxzaclbdjkmpqy) for names  */
+/* 26:    BOS_TEXT (text generation mode)                     */
+/* 27:    EOS (end of sequence)                               */
+/* 28-37: ASCII shade chars " .:-=+*#%@" (10 brightness levels) */
+/* 38:    NEWLINE (row separator in ASCII art)                */
+/* 39:    BOS_DRAW (ASCII art generation mode)                */
+#define VOCAB           40
+#define BOS_TOK         26  /* text mode start */
+#define EOS_TOK         27
+#define SHADE_START     28  /* first ASCII shade token */
+#define SHADE_END       37  /* last ASCII shade token */
+#define NL_TOK          38  /* newline in ASCII art */
+#define BOS_DRAW        39  /* draw mode start */
 
 /* ASCII art config */
 #define ASCII_COLS      8   /* output ASCII width */
 #define ASCII_ROWS      8   /* output ASCII height */
 
 /* Training defaults */
-#define DEFAULT_STEPS   20000
+#define DEFAULT_STEPS   30000
 #define LR_BASE         3e-4f
 
 /* Hebbian */
@@ -372,16 +373,19 @@ static float visual_prophecy(const HebbianVision* hv, int token, const float* vi
 static const char* digit_names[] = {
     "zero", "one", "two", "three", "four",
     "five", "six", "seven", "eight", "nine",
-    "house", "arrow", "star", "cross", "heart", "circle"
+    "house", "arrow", "star", "cross", "heart", "circle",
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
+    "k", "l", "m", "n", "o", "p", "q", "r", "s", "t",
+    "u", "v", "w", "x", "y", "z"
 };
-#define N_OBJECTS 16 /* 10 digits + 6 shapes */
+#define N_OBJECTS 42 /* 10 digits + 6 shapes + 26 letters */
 
-static const char text_chars[] = "efghinorstuvwxzacl"; /* 18 chars: original 15 + acl at end */
+static const char text_chars[] = "efghinorstuvwxzaclbdjkmpqy"; /* 26 chars: original 18 + bdjkmpqy */
 
 static const char ascii_shades[] = " .:-=+*#%@"; /* 10 levels, index 0-9 */
 
 static int char_to_id(char ch) {
-    for (int i = 0; i < 18; i++)
+    for (int i = 0; i < 26; i++)
         if (text_chars[i] == ch) return i;
     return -1;
 }
@@ -393,7 +397,7 @@ static char id_to_char(int id) {
     if (id == NL_TOK) return '\n';
     if (id >= SHADE_START && id <= SHADE_END)
         return ascii_shades[id - SHADE_START];
-    if (id >= 0 && id < 18) return text_chars[id];
+    if (id >= 0 && id < 26) return text_chars[id];
     return '?';
 }
 
@@ -520,6 +524,85 @@ static const float digit_patterns_8x8[10][64] = {
     {0,0,.8,.8,.8,0,0,0, 0,.8,.5,.5,.5,.8,0,0, .8,.5,.5,.5,.5,.5,.8,0,
      .8,.5,.5,.5,.5,.5,.8,0, .8,.5,.5,.5,.5,.5,.8,0, 0,.8,.5,.5,.5,.8,0,0,
      0,0,.8,.8,.8,0,0,0, 0,0,0,0,0,0,0,0},
+    /* 16-41: Block letters A-Z, unified style with 0.5 edges like digits */
+    /* A */ {0,0,.5,.8,.5,0,0,0, 0,.5,0,0,.5,0,0,0, .8,0,0,0,0,.8,0,0,
+     .8,0,0,0,0,.8,0,0, .8,.8,.8,.8,.8,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0},
+    /* B */ {.8,.8,.8,.8,.5,0,0,0, .8,0,0,0,.5,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,.8,.8,.8,.5,0,0,0, .8,0,0,0,.5,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,0,0,0,.5,.8,0,0, .8,.8,.8,.8,.5,0,0,0},
+    /* C */ {0,.5,.8,.8,.5,0,0,0, .8,.5,0,0,.5,.8,0,0, .8,0,0,0,0,0,0,0,
+     .8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0,
+     .8,.5,0,0,.5,.8,0,0, 0,.5,.8,.8,.5,0,0,0},
+    /* D */ {.8,.8,.8,.5,0,0,0,0, .8,0,0,.5,.8,0,0,0, .8,0,0,0,.5,.8,0,0,
+     .8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0, .8,0,0,0,.5,.8,0,0,
+     .8,0,0,.5,.8,0,0,0, .8,.8,.8,.5,0,0,0,0},
+    /* E */ {.8,.8,.8,.8,.8,0,0,0, .8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0,
+     .8,.8,.8,.5,0,0,0,0, .8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0,
+     .8,0,0,0,0,0,0,0, .8,.8,.8,.8,.8,0,0,0},
+    /* F */ {.8,.8,.8,.8,.8,0,0,0, .8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0,
+     .8,.8,.8,.5,0,0,0,0, .8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0,
+     .8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0},
+    /* G */ {0,.5,.8,.8,.5,0,0,0, .8,.5,0,0,.5,.8,0,0, .8,0,0,0,0,0,0,0,
+     .8,0,0,0,0,0,0,0, .8,0,0,.5,.8,.8,0,0, .8,0,0,0,.5,.8,0,0,
+     .8,.5,0,0,.5,.8,0,0, 0,.5,.8,.8,.5,0,0,0},
+    /* H */ {.8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,.8,.8,.8,.8,.8,0,0, .8,.5,0,0,.5,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0},
+    /* I */ {.5,.8,.8,.8,.8,.5,0,0, 0,0,.5,.8,.5,0,0,0, 0,0,0,.8,0,0,0,0,
+     0,0,0,.8,0,0,0,0, 0,0,0,.8,0,0,0,0, 0,0,0,.8,0,0,0,0,
+     0,0,.5,.8,.5,0,0,0, .5,.8,.8,.8,.8,.5,0,0},
+    /* J */ {0,0,0,.5,.8,0,0,0, 0,0,0,0,.8,0,0,0, 0,0,0,0,.8,0,0,0,
+     0,0,0,0,.8,0,0,0, 0,0,0,0,.8,0,0,0, .8,0,0,0,.8,0,0,0,
+     .8,.5,0,.5,.8,0,0,0, 0,.5,.8,.5,0,0,0,0},
+    /* K */ {.8,0,0,0,.8,0,0,0, .8,0,0,.8,.5,0,0,0, .8,0,.8,.5,0,0,0,0,
+     .8,.8,.5,0,0,0,0,0, .8,.8,.5,0,0,0,0,0, .8,0,.8,.5,0,0,0,0,
+     .8,0,0,.8,.5,0,0,0, .8,0,0,0,.8,0,0,0},
+    /* L */ {.8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0,
+     .8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0,
+     .8,0,0,0,0,0,0,0, .8,.8,.8,.8,.8,.5,0,0},
+    /* M */ {.8,.5,0,0,.5,.8,0,0, .8,.8,0,0,.8,.8,0,0, .8,.5,.8,.8,.5,.8,0,0,
+     .8,0,.5,.5,0,.8,0,0, .8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0},
+    /* N */ {.8,.5,0,0,0,.8,0,0, .8,.8,0,0,0,.8,0,0, .8,.5,.8,0,0,.8,0,0,
+     .8,0,.5,.8,0,.8,0,0, .8,0,0,.8,.5,.8,0,0, .8,0,0,0,.8,.8,0,0,
+     .8,0,0,0,.5,.8,0,0, .8,0,0,0,0,.8,0,0},
+    /* O */ {0,.5,.8,.8,.5,0,0,0, .8,.5,0,0,.5,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,.5,0,0,.5,.8,0,0, 0,.5,.8,.8,.5,0,0,0},
+    /* P */ {.8,.8,.8,.8,.5,0,0,0, .8,0,0,0,.5,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,.8,.8,.8,.5,0,0,0, .8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0,
+     .8,0,0,0,0,0,0,0, .8,0,0,0,0,0,0,0},
+    /* Q */ {0,.5,.8,.8,.5,0,0,0, .8,.5,0,0,.5,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,0,0,0,0,.8,0,0, .8,0,0,.8,0,.8,0,0, .8,0,0,.5,.8,.5,0,0,
+     0,.5,.8,.8,.5,.8,0,0, 0,0,0,0,0,.5,.8,0},
+    /* R */ {.8,.8,.8,.8,.5,0,0,0, .8,0,0,0,.5,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,.8,.8,.8,.5,0,0,0, .8,0,.8,.5,0,0,0,0, .8,0,.5,.8,0,0,0,0,
+     .8,0,0,.5,.8,0,0,0, .8,0,0,0,.5,.8,0,0},
+    /* S */ {0,.5,.8,.8,.5,0,0,0, .8,.5,0,0,0,0,0,0, .8,0,0,0,0,0,0,0,
+     0,.5,.8,.8,.5,0,0,0, 0,0,0,0,.5,.8,0,0, 0,0,0,0,0,.8,0,0,
+     0,0,0,0,.5,.8,0,0, .8,.8,.8,.8,.5,0,0,0},
+    /* T */ {.8,.8,.8,.8,.8,.8,0,0, .5,0,.5,.8,.5,0,0,0, 0,0,0,.8,0,0,0,0,
+     0,0,0,.8,0,0,0,0, 0,0,0,.8,0,0,0,0, 0,0,0,.8,0,0,0,0,
+     0,0,0,.8,0,0,0,0, 0,0,.5,.8,.5,0,0,0},
+    /* U */ {.8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,.5,0,0,.5,.8,0,0, 0,.5,.8,.8,.5,0,0,0},
+    /* V */ {.8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0, .8,.5,0,0,.5,.8,0,0,
+     0,.8,0,0,.8,0,0,0, 0,.8,.5,.5,.8,0,0,0, 0,.5,.8,.8,.5,0,0,0,
+     0,0,.5,.5,0,0,0,0, 0,0,0,0,0,0,0,0},
+    /* W */ {.8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0, .8,0,0,0,0,.8,0,0,
+     .8,0,.5,.5,0,.8,0,0, .8,.5,.8,.8,.5,.8,0,0, .8,.8,.5,.5,.8,.8,0,0,
+     .8,.5,0,0,.5,.8,0,0, .5,0,0,0,0,.5,0,0},
+    /* X */ {.8,0,0,0,0,.8,0,0, .5,.8,0,0,.8,.5,0,0, 0,.5,.8,.8,.5,0,0,0,
+     0,0,.5,.5,0,0,0,0, 0,.5,.8,.8,.5,0,0,0, .5,.8,0,0,.8,.5,0,0,
+     .8,0,0,0,0,.8,0,0, 0,0,0,0,0,0,0,0},
+    /* Y */ {.8,0,0,0,0,.8,0,0, .5,.8,0,0,.8,.5,0,0, 0,.5,.8,.8,.5,0,0,0,
+     0,0,.5,.8,.5,0,0,0, 0,0,0,.8,0,0,0,0, 0,0,0,.8,0,0,0,0,
+     0,0,0,.8,0,0,0,0, 0,0,.5,.8,.5,0,0,0},
+    /* Z */ {.8,.8,.8,.8,.8,.8,0,0, 0,0,0,.5,.8,.5,0,0, 0,0,.5,.8,.5,0,0,0,
+     0,0,.8,.5,0,0,0,0, 0,.8,.5,0,0,0,0,0, .5,.8,0,0,0,0,0,0,
+     .8,.5,0,0,0,0,0,0, .8,.8,.8,.8,.8,.8,0,0},
 };
 
 typedef struct {
@@ -876,8 +959,8 @@ static void train(NeoVLM* m, Dataset* data, int steps) {
     printf("  sequence: %d vision + %d text/draw = %d max\n", N_VIS, MAX_TEXT, MAX_SEQ);
     long np = count_params(m);
     printf("  params: %ld (%.2fM, %.2f MB)\n", np, np / 1e6f, np * 4.0f / 1048576.0f);
-    printf("  vocab: %d (18 text + 10 ASCII shades + BOS_TEXT + BOS_DRAW + EOS + NL)\n", VOCAB);
-    printf("  objects: %d (10 digits + house, arrow, star, cross, heart, circle)\n", N_OBJECTS);
+    printf("  vocab: %d (26 text + 10 ASCII shades + BOS_TEXT + BOS_DRAW + EOS + NL)\n", VOCAB);
+    printf("  objects: %d (10 digits + 6 shapes + 26 block letters A-Z)\n", N_OBJECTS);
     printf("  RRPRAM: relative position bias, %d params/layer\n", N_HEADS * MAX_SEQ);
     printf("  Hebbian: vis_proto [%d x %d], updated every step\n", VOCAB, DM);
     printf("  Dario: %d chambers, Kuramoto K=0.03\n", N_CHAMBERS);
@@ -1388,6 +1471,7 @@ int main(int argc, char** argv) {
     int do_interactive = 0;
     const char* load_path = NULL;
     const char* save_path = "neovlm.ckpt";
+    const char* real_dir = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc)
@@ -1398,17 +1482,96 @@ int main(int argc, char** argv) {
             load_path = argv[++i];
         else if (strcmp(argv[i], "--save") == 0 && i + 1 < argc)
             save_path = argv[++i];
+        else if (strcmp(argv[i], "--real") == 0 && i + 1 < argc)
+            real_dir = argv[++i];
     }
 
     /* Init */
     rng_seed(42);
     nt_seed(42);
 
-    /* Generate data */
-    printf("generating synthetic 32x32 digit patterns...\n");
-    Dataset data = generate_data(16000);
-    printf("generated %d images, %dx%d, %d patches of %dx%d\n\n",
-           data.n, IMG_SIZE, IMG_SIZE, N_VIS, PATCH_SIZE, PATCH_SIZE);
+    /* Load data — real images or synthetic */
+    Dataset data;
+    if (real_dir) {
+        /* Load real images from directory via notorch_vision */
+        printf("loading real images from %s...\n", real_dir);
+        char captions_path[512];
+        snprintf(captions_path, sizeof(captions_path), "%s/captions.txt", real_dir);
+        FILE* cf = fopen(captions_path, "r");
+        if (!cf) {
+            printf("  ERROR: %s/captions.txt not found\n", real_dir);
+            return 1;
+        }
+        /* Count lines */
+        int n_real = 0;
+        char line[1024];
+        while (fgets(line, sizeof(line), cf)) {
+            if (strchr(line, '\t')) n_real++;
+        }
+        rewind(cf);
+
+        data.n = 0;
+        data.labels = (int*)malloc(n_real * N_OBJECTS * sizeof(int)); /* repeat for training */
+        data.images = (float**)malloc(n_real * N_OBJECTS * sizeof(float*));
+
+        int real_count = 0;
+        float* real_imgs[256];
+        int real_labels[256];
+        char real_names[256][64];
+
+        while (fgets(line, sizeof(line), cf) && real_count < 256) {
+            int len = (int)strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+            char* tab = strchr(line, '\t');
+            if (!tab) continue;
+            *tab = '\0';
+            char* caption = tab + 1;
+
+            char img_path[512];
+            snprintf(img_path, sizeof(img_path), "%s/%s", real_dir, line);
+            nt_tensor* img_t = nt_gray_preprocess(img_path, IMG_SIZE);
+            if (!img_t) { printf("  skip: %s\n", line); continue; }
+
+            /* Find label by caption name */
+            int label = -1;
+            for (int j = 0; j < N_OBJECTS; j++) {
+                if (strcmp(caption, digit_names[j]) == 0) { label = j; break; }
+            }
+            if (label < 0) { printf("  skip unknown caption: %s\n", caption); nt_tensor_free(img_t); continue; }
+
+            real_imgs[real_count] = (float*)malloc(IMG_SIZE * IMG_SIZE * sizeof(float));
+            memcpy(real_imgs[real_count], img_t->data, IMG_SIZE * IMG_SIZE * sizeof(float));
+            real_labels[real_count] = label;
+            strncpy(real_names[real_count], caption, 63);
+            nt_tensor_free(img_t);
+            real_count++;
+        }
+        fclose(cf);
+
+        /* Duplicate to fill dataset (like synthetic with noise) */
+        int target_n = real_count * 100; /* 100 augmented copies each */
+        data.n = target_n;
+        data.labels = (int*)realloc(data.labels, target_n * sizeof(int));
+        data.images = (float**)realloc(data.images, target_n * sizeof(float*));
+        for (int i = 0; i < target_n; i++) {
+            int src = i % real_count;
+            data.labels[i] = real_labels[src];
+            data.images[i] = (float*)malloc(IMG_SIZE * IMG_SIZE * sizeof(float));
+            /* Copy with noise augmentation */
+            for (int p = 0; p < IMG_SIZE * IMG_SIZE; p++) {
+                float noise = rng_normal(0, 0.04f);
+                float v = real_imgs[src][p] + noise;
+                data.images[i][p] = v < 0 ? 0 : (v > 1 ? 1 : v);
+            }
+        }
+        for (int i = 0; i < real_count; i++) free(real_imgs[i]);
+        printf("loaded %d real images, augmented to %d\n\n", real_count, target_n);
+    } else {
+        printf("generating synthetic 32x32 patterns...\n");
+        data = generate_data(42000);
+        printf("generated %d images, %dx%d, %d patches of %dx%d\n\n",
+               data.n, IMG_SIZE, IMG_SIZE, N_VIS, PATCH_SIZE, PATCH_SIZE);
+    }
 
     /* Create model */
     NeoVLM* model = model_create();

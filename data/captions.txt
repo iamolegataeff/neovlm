@@ -1,0 +1,10 @@
+zero.bmp	zero
+one.bmp	one
+four.bmp	four
+seven.bmp	seven
+a.bmp	a
+h.bmp	h
+house.bmp	house
+star.bmp	star
+cross.bmp	cross
+heart.bmp	heart
